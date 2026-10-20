@@ -1,0 +1,468 @@
+#!/usr/bin/env node
+// =============================================================================
+// agent-comm file coordination hook
+//
+// Install in your Claude Code settings.json as both PreToolUse and PostToolUse
+// matcher for Edit|Write|MultiEdit. Talks to a running agent-comm dashboard
+// (default http://localhost:3421) to claim file locks via the REST cas
+// endpoint and broadcast edit summaries to a shared world model.
+//
+// PreToolUse: claim the target file. If another agent holds the lock, BLOCK the
+//   tool call (exit 2) with a message telling the agent who holds it. The model
+//   then sees the block and can recover (call comm_send to coordinate, wait,
+//   pick a different file, etc.).
+//
+// PostToolUse: release the claim and update the "files-edited" world model
+//   namespace with a summary of who edited what and when.
+//
+// Identity: each agent should set AGENT_COMM_ID in its environment (the bench
+// driver does this; for a real workflow you can set it in your shell rc or per
+// terminal). Falls back to hostname-pid if unset.
+//
+// Failure mode: if agent-comm REST is not reachable, the hook fails OPEN (exits
+// 0, allows the edit). Coordination is best-effort — never block real work just
+// because the bus is down.
+//
+// -----------------------------------------------------------------------------
+// T2 overhead reduction (v1.3.9+) — local optimistic cache
+// -----------------------------------------------------------------------------
+// The REST round-trip per Edit adds 15-45% wall-time even when the lock is
+// uncontended. To cut that down we keep a tiny per-agent JSON cache at
+// `<TMP>/agent-comm-hook-cache-<agent-id>.json` mapping file paths to:
+//   { holder, claimed_at, released_at, released_pending }
+//
+// Fast paths:
+//   T2.C same-agent-same-file: if the cache says WE recently claimed this file
+//     AND we're still within THROTTLE_MS, the PreToolUse skips the REST cas
+//     entirely (outcome "cache-hit-self"). PostToolUse marks the lock as
+//     "release pending" locally but does NOT immediately DELETE on REST —
+//     instead the next claim refreshes the TTL in place, or an eventual claim
+//     past THROTTLE_MS triggers a proper release+re-claim.
+//
+//   T2.A shared uncontended: currently folded into the same cache-hit-self
+//     path — once we've observed nobody else racing us for this file within
+//     the throttle window, subsequent edits skip the round-trip. This is safe
+//     because the hook is fail-open: the worst case is we assume we still
+//     hold a lock that silently expired, which is indistinguishable from the
+//     dashboard being down at claim time.
+//
+//   T2.B MultiEdit: the hook protocol already sends exactly one Pre + one Post
+//     per MultiEdit tool call regardless of how many inline edits the tool
+//     performs, so MultiEdit is "batched" for free. What T2.B guarantees here
+//     is that the claim/release bookkeeping is idempotent per tool call (no
+//     double-claim, no double-release) when the same file appears in a
+//     MultiEdit's sequential edits — handled by keying the cache off the
+//     absolute file path rather than any per-edit index.
+//
+// Fail-open contract: if the cache file itself is corrupt / unwritable the
+// hook falls back to the original REST-only path. Cache errors never block.
+// =============================================================================
+
+import { request } from 'node:http';
+import { hostname, tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { signalFailOpen, signalBlock } from './_fail-open.mjs';
+
+// -----------------------------------------------------------------------------
+// Optional trace: when AGENT_COMM_HOOK_TRACE=1 or AGENT_COMM_HOOK_TRACE_FILE is
+// set, every invocation appends one JSON line describing the outcome. Used by
+// the bench runner to prove the hook actually fires on Windows (the v1.3.4
+// IPv4 bug previously caused silent fail-open; the trace is the canary).
+//
+// Default (neither env var set) = no trace, no extra IO. MUST never throw — a
+// trace write failure (permission denied, disk full) must not block the edit.
+// -----------------------------------------------------------------------------
+const TRACE_FILE =
+  process.env.AGENT_COMM_HOOK_TRACE_FILE ??
+  (process.env.AGENT_COMM_HOOK_TRACE === '1'
+    ? `${process.env.TEMP ?? process.env.TMPDIR ?? '.'}/agent-comm-hook-trace.log`
+    : null);
+
+function trace(phase, tool, filePath, outcome, holder) {
+  if (!TRACE_FILE) return;
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      phase,
+      tool,
+      file: filePath,
+      outcome,
+      ...(holder ? { holder } : {}),
+      agent: AGENT_ID,
+    });
+    appendFileSync(TRACE_FILE, line + '\n');
+  } catch {
+    // Swallow all errors — trace is diagnostic, never blocks real work.
+  }
+}
+
+const PORT = parseInt(process.env.AGENT_COMM_PORT ?? '3421', 10);
+const HOST = process.env.AGENT_COMM_HOST ?? 'localhost';
+const LOCK_NS = process.env.AGENT_COMM_LOCK_NAMESPACE ?? 'file-locks';
+const FILES_NS = process.env.AGENT_COMM_FILES_NAMESPACE ?? 'files-edited';
+const TTL = parseInt(process.env.AGENT_COMM_LOCK_TTL ?? '300', 10);
+// Identity resolution order:
+//   1. AGENT_COMM_ID env var (set explicitly by the user or driver)
+//   2. CLAUDE_CODE_SESSION_ID if Claude Code provides one
+//   3. hostname-ppid (the parent process — Claude Code itself — has a stable
+//      pid for the lifetime of the session, so PreToolUse and PostToolUse for
+//      the same edit see the same ppid)
+const AGENT_ID =
+  process.env.AGENT_COMM_ID ??
+  process.env.CLAUDE_CODE_SESSION_ID ??
+  `${hostname()}-${process.ppid || process.pid}`;
+// Claude Code passes the hook event name as the first arg or HOOK_EVENT env var
+// depending on version. Accept either.
+const EVENT = process.argv[2] ?? process.env.CLAUDE_HOOK_EVENT ?? 'PreToolUse';
+
+// -----------------------------------------------------------------------------
+// Local optimistic cache (T2.A/B/C)
+// -----------------------------------------------------------------------------
+// Cache is a small JSON file per agent identity. We read+write on every hook
+// invocation; the file is tiny (bytes per entry) and per-PID contention is zero
+// since each agent has a distinct cache path. If the file is missing/corrupt
+// we fall back to the REST-only path (fail-open).
+//
+// Cache entry shape:
+//   {
+//     holder: string,         // last observed lock holder (usually AGENT_ID)
+//     claimed_at: number,     // epoch ms of last claim
+//     release_pending: bool,  // PostToolUse ran but we're deferring REST delete
+//                             // so a re-claim within THROTTLE_MS is free
+//   }
+//
+// THROTTLE_MS must be strictly LESS than TTL*1000 so a cache hit can never
+// survive past the server-side lock expiry. Defaulting to 30s with TTL=300s
+// gives a 10x safety margin.
+// -----------------------------------------------------------------------------
+const CACHE_THROTTLE_MS = parseInt(process.env.AGENT_COMM_HOOK_CACHE_MS ?? '30000', 10);
+const CACHE_DISABLED = process.env.AGENT_COMM_HOOK_CACHE === '0';
+
+function cachePath() {
+  // Sanitize AGENT_ID for a filename — strip anything that's not safe on
+  // Windows / POSIX filenames. Keep it short.
+  const safe = String(AGENT_ID)
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .slice(0, 120);
+  const dir = process.env.AGENT_COMM_HOOK_CACHE_DIR ?? tmpdir();
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // ignore — writeFile will surface any real problem and we fail-open
+  }
+  return join(dir, `agent-comm-hook-cache-${safe}.json`);
+}
+
+function readCache() {
+  if (CACHE_DISABLED) return {};
+  try {
+    const raw = readFileSync(cachePath(), 'utf8');
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCache(cache) {
+  if (CACHE_DISABLED) return;
+  try {
+    // Prune stale entries opportunistically so the file can't grow without
+    // bound across a long-lived session.
+    const now = Date.now();
+    const cutoff = now - CACHE_THROTTLE_MS * 4;
+    for (const k of Object.keys(cache)) {
+      const e = cache[k];
+      if (!e || typeof e.claimed_at !== 'number' || e.claimed_at < cutoff) {
+        delete cache[k];
+      }
+    }
+    writeFileSync(cachePath(), JSON.stringify(cache));
+  } catch {
+    // Cache write failed — continue without caching. Next hook invocation
+    // will just hit REST as usual.
+  }
+}
+
+function cacheHitSelf(entry) {
+  if (!entry) return false;
+  if (entry.holder !== AGENT_ID) return false;
+  const age = Date.now() - (entry.claimed_at ?? 0);
+  return age >= 0 && age < CACHE_THROTTLE_MS;
+}
+
+function call(method, path, body) {
+  return new Promise((resolve) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = request(
+      {
+        host: HOST,
+        port: PORT,
+        path,
+        method,
+        // Force IPv4 — on Windows, Node's default localhost resolution can
+        // pick ::1 first and fail with ECONNREFUSED if the dashboard binds
+        // only to 0.0.0.0 (IPv4). curl handles this via fallback; Node's
+        // http.request does not. This was a silent killer for the file-coord
+        // hook on Windows: every PostToolUse write was returning null and the
+        // hook exited 0, masking the failure.
+        family: 4,
+        headers: data
+          ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+          : {},
+        timeout: 1500,
+      },
+      (res) => {
+        let buf = '';
+        res.on('data', (c) => (buf += c));
+        res.on('end', () => {
+          try {
+            resolve({ status: res.statusCode ?? 0, body: buf ? JSON.parse(buf) : null });
+          } catch {
+            resolve({ status: res.statusCode ?? 0, body: null });
+          }
+        });
+      },
+    );
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+function urlEncode(s) {
+  return encodeURIComponent(s);
+}
+
+// How long to poll for a lock to become free before giving up. The hook
+// blocks the Claude tool call while polling, so this is also the max
+// per-edit wait time. Tunable via env var.
+//
+// Default 10s — long enough that a typical sibling edit (read + edit + write
+// + release ~1-5s) completes within one poll window, but short enough that
+// agents waiting on a contended file fail fast and let the model react
+// (try a different file, coordinate via comm_send, etc.) instead of burning
+// the entire per-edit budget on a single lock wait.
+const POLL_TIMEOUT_MS = parseInt(process.env.AGENT_COMM_POLL_TIMEOUT_MS ?? '10000', 10);
+const POLL_INTERVAL_MS = parseInt(process.env.AGENT_COMM_POLL_INTERVAL_MS ?? '200', 10);
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function preToolUse(filePath, tool) {
+  // The PreToolUse cache-hit-self fast path is UNSAFE for multi-agent
+  // coordination and was removed. Per-agent local caches cannot see other
+  // agents' claims, so two agents could both fast-path simultaneously when
+  // both had recently held the lock. The file-coord v7 adversarial bench proved this
+  // produces lost-update races even when the hook fires (see 07:28:11 trace
+  // pair where a1 and a2 both took cache-hit-self on counter.json).
+  //
+  // PostToolUse STILL uses the cache (deferred DELETE is safe because the
+  // server-side TTL guarantees eventual release and the shared files-edited
+  // namespace is always written through). See postToolUse() below.
+  const cache = readCache();
+
+  // Poll the cas endpoint until either we acquire the lock, the dashboard
+  // becomes unreachable (fail open), or we hit the poll timeout. This turns
+  // the hook into a true blocking primitive — when there's a single shared
+  // file with no alternative, sibling agents queue up rather than failing.
+  //
+  // Reentrancy: if the lock is currently held by US (same AGENT_ID), we
+  // refresh the TTL and treat the acquisition as successful. This handles
+  // the case where a prior PostToolUse failed to fire (Claude Code timeout,
+  // crash, etc.) and the agent's own old lock would otherwise block its
+  // next edit.
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let lastHolder = 'unknown';
+  let transportFailed = false;
+  while (Date.now() < deadline) {
+    // First try the fresh-claim path: cas null → AGENT_ID
+    const r = await call('POST', `/api/state/${urlEncode(LOCK_NS)}/${urlEncode(filePath)}/cas`, {
+      expected: null,
+      new_value: AGENT_ID,
+      updated_by: AGENT_ID,
+      ttl_seconds: TTL,
+    });
+    if (!r) {
+      transportFailed = true;
+      break;
+    }
+    if (r.status === 200 && r.body?.swapped === true) {
+      // Record the claim locally so the next Edit on this file can fast-path.
+      cache[filePath] = {
+        holder: AGENT_ID,
+        claimed_at: Date.now(),
+        release_pending: false,
+      };
+      writeCache(cache);
+      trace('PreToolUse', tool, filePath, 'claimed');
+      return { allow: true };
+    }
+    if (r.status === 200 && r.body?.swapped === false) {
+      lastHolder = r.body.current?.value ?? lastHolder;
+      // Reentrant case: the holder is US. Refresh the TTL via a self → self
+      // cas and proceed (the previous PostToolUse must have failed).
+      if (lastHolder === AGENT_ID) {
+        const refresh = await call(
+          'POST',
+          `/api/state/${urlEncode(LOCK_NS)}/${urlEncode(filePath)}/cas`,
+          {
+            expected: AGENT_ID,
+            new_value: AGENT_ID,
+            updated_by: AGENT_ID,
+            ttl_seconds: TTL,
+          },
+        );
+        if (refresh && refresh.status === 200 && refresh.body?.swapped === true) {
+          cache[filePath] = {
+            holder: AGENT_ID,
+            claimed_at: Date.now(),
+            release_pending: false,
+          };
+          writeCache(cache);
+          trace('PreToolUse', tool, filePath, 'claimed-reentrant');
+          return { allow: true };
+        }
+        // The lock was released between the two cas calls — loop again,
+        // we'll grab it on the fresh-claim path next iteration.
+      }
+      // Held by someone else — wait and retry.
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+    // Unexpected response — treat as transport failure (fail open).
+    transportFailed = true;
+    break;
+  }
+  if (transportFailed) {
+    // Fail-open: agent-comm dashboard isn't reachable, never block real work.
+    trace('PreToolUse', tool, filePath, 'fail-open');
+    await signalFailOpen('file-coord', 'dashboard-unreachable', {
+      phase: 'PreToolUse',
+      tool,
+      file: filePath,
+    });
+    return { allow: true };
+  }
+  trace('PreToolUse', tool, filePath, 'held-by-other', lastHolder);
+  // Surface the block as a first-class dashboard event (stderr + /api/feed +
+  // optional trace-file line). This is the "prevented conflict" moment — the
+  // hook is doing its job and the user sees the value. Best-effort: if the
+  // emission fails the block still proceeds normally.
+  await signalBlock('file-coord', {
+    tool,
+    target: filePath,
+    holder_agent: lastHolder,
+    reason: 'held-by-other',
+  });
+  return {
+    allow: false,
+    reason: `BLOCKED: agent-comm file lock on ${basename(filePath)} still held by "${lastHolder}" after ${POLL_TIMEOUT_MS / 1000}s of waiting. The other agent may be stuck. Try again, coordinate via comm_send, or work on a different file.`,
+  };
+}
+
+async function postToolUse(filePath, tool) {
+  // If we took the cache-hit-self fast path in Pre, there's no REST lock to
+  // release right now — the server-side entry still has our name and TTL.
+  // We DEFER the release: mark the cache entry release_pending and leave the
+  // remote lock in place. The throttle window (CACHE_THROTTLE_MS) gives
+  // back-to-back Edits a zero-RTT path. When the throttle expires or a
+  // different agent needs the file, the TTL fires server-side.
+  //
+  // The "files-edited" world-model write is still useful (shows activity on
+  // the dashboard), but also deferable on the same grounds — we coalesce
+  // rapid-fire edits into one REST write per throttle window per file.
+  const cache = readCache();
+  const existing = cache[filePath];
+  const cacheFresh =
+    existing &&
+    existing.holder === AGENT_ID &&
+    Date.now() - (existing.claimed_at ?? 0) < CACHE_THROTTLE_MS;
+
+  // The files-edited write is NOT deferable — bash-guard reads this namespace
+  // to detect commit-time conflicts with other agents' recent edits. If we
+  // defer it, `git commit -am` silently sweeps in a sibling agent's WIP
+  // because bash-guard sees zero recent other-edits. Always write, even on
+  // cache-hit-self.
+  const rec = await call('POST', `/api/state/${urlEncode(FILES_NS)}/${urlEncode(filePath)}`, {
+    value: `${AGENT_ID}@${new Date().toISOString()}`,
+    updated_by: AGENT_ID,
+  });
+
+  if (cacheFresh) {
+    // Defer only the DELETE — server-side TTL will clean the lock up. Savings
+    // remain real because DELETE was the hot-path call for back-to-back edits
+    // on the same file by the same agent.
+    existing.release_pending = true;
+    cache[filePath] = existing;
+    writeCache(cache);
+    trace('PostToolUse', tool, filePath, rec ? 'cache-hit-self' : 'fail-open');
+    if (!rec) {
+      await signalFailOpen('file-coord', 'dashboard-unreachable', {
+        phase: 'PostToolUse',
+        tool,
+        file: filePath,
+      });
+    }
+    return;
+  }
+
+  // Stale cache or no cache — drop entry and do the full release.
+  if (existing) {
+    delete cache[filePath];
+    writeCache(cache);
+  }
+
+  // Release the lock — best effort, ignore errors.
+  const del = await call('DELETE', `/api/state/${urlEncode(LOCK_NS)}/${urlEncode(filePath)}`, null);
+  const ok = del && rec;
+  trace('PostToolUse', tool, filePath, ok ? 'released' : 'fail-open');
+  if (!ok) {
+    await signalFailOpen('file-coord', 'dashboard-unreachable', {
+      phase: 'PostToolUse',
+      tool,
+      file: filePath,
+    });
+  }
+}
+
+async function main() {
+  // Read JSON payload from stdin (Claude Code hook protocol).
+  let raw = '';
+  process.stdin.setEncoding('utf8');
+  for await (const chunk of process.stdin) raw += chunk;
+
+  let payload;
+  try {
+    payload = JSON.parse(raw || '{}');
+  } catch {
+    process.exit(0);
+  }
+
+  const tool = payload.tool_name ?? payload.name ?? '';
+  const filePath = payload.tool_input?.file_path ?? payload.input?.file_path ?? '';
+  if (!filePath || !/^(Edit|Write|MultiEdit)$/.test(tool)) {
+    // Not a file-mutating tool we care about. Allow.
+    process.exit(0);
+  }
+
+  if (EVENT === 'PreToolUse') {
+    const result = await preToolUse(filePath, tool);
+    if (result.allow) process.exit(0);
+    process.stderr.write(result.reason + '\n');
+    process.exit(2);
+  } else if (EVENT === 'PostToolUse') {
+    await postToolUse(filePath, tool);
+    process.exit(0);
+  } else {
+    process.exit(0);
+  }
+}
+
+main().catch(() => process.exit(0));
